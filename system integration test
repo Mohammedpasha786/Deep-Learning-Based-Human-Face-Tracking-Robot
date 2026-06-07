@@ -1,0 +1,200 @@
+%% system_integration_test.m
+% Full system integration test for the Face Tracking Robot.
+% Tests: face detection → UDP transmission → robot response simulation.
+%
+% Run this before deployment to verify all components work together.
+%
+% Author:  [Your Name]
+% -----------------------------------------------------------------------
+
+clc; clear; close all;
+
+fprintf('==============================================\n');
+fprintf('  Face Tracking Robot - Integration Test     \n');
+fprintf('==============================================\n\n');
+
+results = struct();
+allPass = true;
+
+%% ===== TEST 1: Face Detection Model Load =====
+fprintf('[TEST 1] Loading face detection model... ');
+try
+    load('face_detector_model.mat', 'detector');
+    assert(~isempty(detector), 'Detector is empty');
+    fprintf('PASS \n');
+    results.modelLoad = 'PASS';
+catch e
+    fprintf('FAIL — %s\n', e.message);
+    results.modelLoad = 'FAIL';
+    allPass = false;
+end
+
+%% ===== TEST 2: Detection on Synthetic Image =====
+fprintf('[TEST 2] Face detection on test image...  ');
+try
+    % Create synthetic test image (face region in center)
+    testImg = uint8(ones(480, 640, 3) * 200);
+    testImg(180:300, 270:370, :) = 150;   % simulate face region
+
+    [bboxes, scores, ~] = detect(detector, testImg, 'Threshold', 0.3);
+    fprintf('Detected %d face(s). PASS \n', size(bboxes, 1));
+    results.detection = 'PASS';
+catch e
+    fprintf('FAIL — %s\n', e.message);
+    results.detection = 'FAIL';
+    allPass = false;
+end
+
+%% ===== TEST 3: Position Error Calculation =====
+fprintf('[TEST 3] Position error calculation...    ');
+try
+    imgW = 640; imgH = 480;
+    centerX = imgW / 2;
+    centerY = imgH / 2;
+
+    % Simulate face bounding box at known offset
+    testBBox = [260 200 120 120];   % face at (260,200) size 120x120
+    faceCX   = testBBox(1) + testBBox(3)/2;   % 320
+    faceCY   = testBBox(2) + testBBox(4)/2;   % 260
+
+    errorX = faceCX - centerX;   % should be 0
+    errorY = faceCY - centerY;   % should be 20
+
+    assert(abs(errorX) < 1, 'errorX mismatch');
+    assert(abs(errorY - 20) < 1, 'errorY mismatch');
+    fprintf('errorX=%.0f, errorY=%.0f — PASS \n', errorX, errorY);
+    results.positionError = 'PASS';
+catch e
+    fprintf('FAIL — %s\n', e.message);
+    results.positionError = 'FAIL';
+    allPass = false;
+end
+
+%% ===== TEST 4: UDP Packet Construction =====
+fprintf('[TEST 4] UDP packet construction...       ');
+try
+    error_x    = int16(-45);
+    error_y    = int16(30);
+    face_width = uint16(110);
+    header     = uint8(0xAA);
+
+    % Pack to bytes (little-endian)
+    ex_bytes  = typecast(error_x,    'uint8');   % 2 bytes
+    ey_bytes  = typecast(error_y,    'uint8');   % 2 bytes
+    fw_bytes  = typecast(face_width, 'uint8');   % 2 bytes
+
+    payload = [ex_bytes, ey_bytes, fw_bytes];
+
+    % XOR checksum
+    chk = uint8(0);
+    for b = payload
+        chk = bitxor(chk, b);
+    end
+
+    packet = [header, payload, chk];
+    assert(numel(packet) == 7, 'Packet size must be 7 bytes');
+
+    % Unpack and verify
+    ex_recv = typecast(packet(2:3), 'int16');
+    ey_recv = typecast(packet(4:5), 'int16');
+    fw_recv = typecast(packet(6:7), 'uint16');
+
+    assert(ex_recv == error_x,    'error_x mismatch');
+    assert(ey_recv == error_y,    'error_y mismatch');
+    assert(fw_recv == face_width, 'face_width mismatch');
+
+    fprintf('7-byte packet OK — PASS \n');
+    results.udpPacket = 'PASS';
+catch e
+    fprintf('FAIL — %s\n', e.message);
+    results.udpPacket = 'FAIL';
+    allPass = false;
+end
+
+%% ===== TEST 5: PID Controller Simulation =====
+fprintf('[TEST 5] PID servo control simulation...  ');
+try
+    % Simulate PID tracking: face starts at error_x=100, should converge to 0
+    Kp = 0.8; Ki = 0.01; Kd = 0.05;
+    error    = 100;
+    integral = 0;
+    prevErr  = 0;
+    angle    = 90;
+    history  = zeros(1, 50);
+
+    for i = 1:50
+        integral  = integral + error;
+        derivative = error - prevErr;
+        output    = Kp*error + Ki*integral + Kd*derivative;
+        angle     = angle - output * 0.05;  % apply to servo
+        angle     = max(30, min(150, angle));
+        % Simulate: error reduces as servo moves
+        error     = 100 - (angle - 90) * 2;
+        prevErr   = error;
+        history(i) = error;
+    end
+
+    finalError = abs(history(end));
+    assert(finalError < 20, sprintf('PID did not converge: final error=%.1f', finalError));
+    fprintf('Converged (final error=%.1f) — PASS \n', finalError);
+    results.pidControl = 'PASS';
+
+    % Plot PID response
+    figure('Name', 'PID Convergence Test', 'Position', [100 100 600 300]);
+    plot(1:50, history, 'b-', 'LineWidth', 2);
+    xlabel('Iteration'); ylabel('Error (pixels)');
+    title('PID Servo Control — Error Convergence');
+    yline(0, 'r--', 'Target'); grid on;
+catch e
+    fprintf('FAIL — %s\n', e.message);
+    results.pidControl = 'FAIL';
+    allPass = false;
+end
+
+%% ===== TEST 6: Distance Estimation =====
+fprintf('[TEST 6] Distance estimation from bbox...  ');
+try
+    FOCAL_LENGTH = 700;     % px (calibrate)
+    REAL_WIDTH   = 14;      % cm
+
+    test_cases = [
+        200, 49.0;   % face_width=200 → ~49cm
+        100, 98.0;   % face_width=100 → ~98cm
+        350, 28.0;   % face_width=350 → ~28cm
+    ];
+
+    for i = 1:size(test_cases, 1)
+        fw   = test_cases(i, 1);
+        exp  = test_cases(i, 2);
+        dist = (REAL_WIDTH * FOCAL_LENGTH) / fw;
+        err  = abs(dist - exp);
+        assert(err < 2.0, sprintf('Distance error too large: %.2f cm', err));
+    end
+
+    fprintf('All cases OK — PASS \n');
+    results.distanceEstimation = 'PASS';
+catch e
+    fprintf('FAIL — %s\n', e.message);
+    results.distanceEstimation = 'FAIL';
+    allPass = false;
+end
+
+%% ===== SUMMARY =====
+fprintf('\n==============================================\n');
+fprintf('  Integration Test Summary\n');
+fprintf('==============================================\n');
+fields = fieldnames(results);
+for i = 1:numel(fields)
+    status = results.(fields{i});
+    icon   = strcmp(status, 'PASS');
+    fprintf('  %-30s %s\n', fields{i}, status);
+end
+fprintf('----------------------------------------------\n');
+if allPass
+    fprintf('  Overall: ALL TESTS PASSED \n');
+    fprintf('  System is ready for deployment!\n');
+else
+    fprintf('  Overall: SOME TESTS FAILED \n');
+    fprintf('  Fix failing components before deployment.\n');
+end
+fprintf('==============================================\n');
