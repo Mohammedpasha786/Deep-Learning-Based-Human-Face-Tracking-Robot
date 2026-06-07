@@ -1,0 +1,259 @@
+%% train_face_detector.m
+% Deep Learning-Based Face Detection Training Script
+% Uses MATLAB Deep Learning Toolbox to train a CNN face detector.
+%
+% Project: Autonomous Human Face Tracking Robot
+% Tools:   Computer Vision Toolbox, Deep Learning Toolbox
+%
+% Steps:
+%   1. Load and prepare dataset (WIDER Face / custom dataset)
+%   2. Define CNN architecture
+%   3. Train the detector
+%   4. Evaluate performance
+%   5. Export model for Android deployment
+%
+% Author:  [Your Name]
+% Date:    2024
+clc; clear; close all;
+
+%% ========== CONFIGURATION ==========
+config.dataDir        = fullfile(pwd, '..', '..', 'data');   % Dataset root
+config.imageSize      = [224 224 3];                         % CNN input size
+config.numClasses     = 1;                                   % 'face' only
+config.trainRatio     = 0.8;
+config.validRatio     = 0.1;
+config.testRatio      = 0.1;
+config.numEpochs      = 50;
+config.miniBatchSize  = 32;
+config.learningRate   = 1e-3;
+config.outputModelFile = 'face_detector_model.mat';
+config.exportDir      = fullfile(pwd, '..', '..', 'android_app');
+config.doDataAugment  = true;
+
+fprintf('=== Face Detector Training Script ===\n');
+fprintf('Image size   : %dx%dx%d\n', config.imageSize);
+fprintf('Epochs       : %d\n', config.numEpochs);
+fprintf('Batch size   : %d\n', config.miniBatchSize);
+fprintf('Learning rate: %.4f\n', config.learningRate);
+fprintf('=====================================\n\n');
+
+%% ========== STEP 1: LOAD DATASET ==========
+fprintf('[1/5] Loading dataset...\n');
+
+% Option A: Use MATLAB's built-in face dataset for quick testing
+% Uncomment if using custom dataset in config.dataDir
+% imgDS = imageDatastore(config.dataDir, ...
+%     'IncludeSubfolders', true, ...
+%     'LabelSource', 'foldernames');
+
+% Option B: Use vision.CascadeObjectDetector to generate initial labels
+% then refine with your CNN (bootstrap approach)
+
+% For demonstration: create synthetic training data using webcam frames
+% In production: replace with WIDER Face / LFW annotations
+try
+    % Try loading a pre-annotated ground truth table
+    load(fullfile(config.dataDir, 'face_annotations.mat'), 'gTruth');
+    fprintf('  Loaded ground truth with %d images.\n', height(gTruth));
+catch
+    fprintf('  No pre-existing dataset found.\n');
+    fprintf('  Creating demo dataset from sample images...\n');
+    gTruth = create_demo_dataset(config);
+end
+
+%% ========== STEP 2: PREPARE DATASTORES ==========
+fprintf('[2/5] Preparing datastores...\n');
+
+% Split dataset
+numImages = height(gTruth);
+idx       = randperm(numImages);
+nTrain    = round(config.trainRatio * numImages);
+nValid    = round(config.validRatio * numImages);
+
+trainIdx  = idx(1:nTrain);
+validIdx  = idx(nTrain+1:nTrain+nValid);
+testIdx   = idx(nTrain+nValid+1:end);
+
+trainData = gTruth(trainIdx, :);
+validData = gTruth(validIdx, :);
+testData  = gTruth(testIdx,  :);
+
+fprintf('  Train: %d | Valid: %d | Test: %d\n', ...
+    height(trainData), height(validData), height(testData));
+
+% Create boxLabelDatastore
+trainImgDS  = imageDatastore(trainData.imageFilename);
+trainBoxDS  = boxLabelDatastore(trainData(:, 2:end));
+trainDS     = combine(trainImgDS, trainBoxDS);
+
+validImgDS  = imageDatastore(validData.imageFilename);
+validBoxDS  = boxLabelDatastore(validData(:, 2:end));
+validDS     = combine(validImgDS, validBoxDS);
+
+% Data augmentation pipeline
+if config.doDataAugment
+    augDS = transform(trainDS, @augment_face_data);
+else
+    augDS = trainDS;
+end
+
+%% ========== STEP 3: DEFINE CNN ARCHITECTURE ==========
+fprintf('[3/5] Building CNN architecture...\n');
+
+% Use YOLOv2 detector with ResNet-18 backbone (via Deep Learning Toolbox)
+% Anchor box sizes are estimated from the dataset
+anchorBoxes = estimate_anchor_boxes(trainDS, 6);
+
+% Feature extraction network: ResNet-18 pretrained on ImageNet
+baseNet       = resnet18;
+lgraph        = layerGraph(baseNet);
+
+% Select feature extraction layer
+featureLayer  = 'res4b_relu';   % Output of ResNet-18 4th residual block
+
+% Define YOLO v2 detection network
+detectorNet = yolov2Layers(config.imageSize, config.numClasses, ...
+    anchorBoxes, baseNet, featureLayer);
+
+fprintf('  Network: YOLOv2 + ResNet-18 backbone\n');
+fprintf('  Feature layer: %s\n', featureLayer);
+fprintf('  Anchor boxes: %d\n', size(anchorBoxes, 1));
+
+%% ========== STEP 4: TRAINING OPTIONS ==========
+fprintf('[4/5] Configuring training options...\n');
+
+options = trainingOptions('adam', ...
+    'InitialLearnRate',    config.learningRate, ...
+    'MiniBatchSize',       config.miniBatchSize, ...
+    'MaxEpochs',           config.numEpochs, ...
+    'Shuffle',             'every-epoch', ...
+    'ValidationData',      validDS, ...
+    'ValidationFrequency', 10, ...
+    'Verbose',             true, ...
+    'VerboseFrequency',    5, ...
+    'Plots',               'training-progress', ...
+    'LearnRateSchedule',   'piecewise', ...
+    'LearnRateDropFactor',  0.1, ...
+    'LearnRateDropPeriod',  30, ...
+    'L2Regularization',     1e-4, ...
+    'CheckpointPath',       fullfile(config.dataDir, 'checkpoints'));
+
+%% ========== STEP 5: TRAIN DETECTOR ==========
+fprintf('[5/5] Training face detector...\n');
+fprintf('  This may take several minutes to hours depending on your GPU.\n\n');
+
+[detector, info] = trainYOLOv2ObjectDetector(augDS, detectorNet, options);
+
+%% ========== EVALUATION ==========
+fprintf('\n=== Evaluating on Test Set ===\n');
+
+testImgDS = imageDatastore(testData.imageFilename);
+testBoxDS = boxLabelDatastore(testData(:, 2:end));
+
+% Run detection on test set
+detectionResults = detect(detector, testImgDS, ...
+    'MiniBatchSize', 16, ...
+    'Threshold', 0.5);
+
+% Compute average precision
+[ap, recall, precision] = evaluateDetectionPrecision(...
+    detectionResults, testBoxDS);
+
+fprintf('  Average Precision (AP): %.4f\n', ap);
+fprintf('  Recall  @ threshold 0.5: %.4f\n', recall(end));
+fprintf('  Precision @ threshold 0.5: %.4f\n', precision(end));
+
+% Plot precision-recall curve
+figure('Name', 'Precision-Recall Curve');
+plot(recall, precision, 'b-', 'LineWidth', 2);
+xlabel('Recall');
+ylabel('Precision');
+title(sprintf('Face Detection PR Curve (AP = %.4f)', ap));
+grid on;
+
+%% ========== SAVE MODEL ==========
+fprintf('\n=== Saving Model ===\n');
+
+save(config.outputModelFile, 'detector', 'info', 'config', 'ap');
+fprintf('  Model saved: %s\n', config.outputModelFile);
+
+%% ========== EXPORT FOR ANDROID ==========
+fprintf('\n=== Exporting for Android Deployment ===\n');
+
+% Export as ONNX for Simulink Android support package
+exportONNXNetwork(detector.Network, ...
+    fullfile(config.exportDir, 'face_detector.onnx'));
+fprintf('  ONNX model exported: face_detector.onnx\n');
+
+fprintf('\nTraining complete!\n');
+fprintf('   Model AP: %.4f\n', ap);
+fprintf('   Ready for Android deployment.\n');
+
+%% ========== HELPER FUNCTIONS ==========
+
+function augData = augment_face_data(data)
+    % Apply random augmentations for robust training
+    img  = data{1};
+    bbox = data{2};
+    lbl  = data{3};
+
+    % Random horizontal flip
+    if rand < 0.5
+        img  = fliplr(img);
+        bbox = bboxresize(bbox, size(img, [1 2]));
+        % Mirror bounding box x coordinates
+        imgW = size(img, 2);
+        bbox(:, 1) = imgW - bbox(:, 1) - bbox(:, 3) + 1;
+    end
+
+    % Random brightness jitter
+    img = img + int16(randn * 10);
+    img = uint8(max(0, min(255, img)));
+
+    % Random contrast
+    alpha = 0.8 + rand * 0.4;   % [0.8, 1.2]
+    img   = uint8(double(img) * alpha);
+
+    augData = {img, bbox, lbl};
+end
+
+function anchorBoxes = estimate_anchor_boxes(ds, numAnchors)
+    % K-means clustering to estimate optimal anchor boxes
+    fprintf('  Estimating %d anchor boxes via K-means...\n', numAnchors);
+    anchorBoxes = estimateAnchorBoxes(ds, numAnchors);
+    fprintf('  Anchor box sizes:\n');
+    disp(anchorBoxes);
+end
+
+function gTruth = create_demo_dataset(config)
+    % Creates a minimal demo ground truth table using MATLAB's
+    % built-in Cascade face detector for auto-labeling.
+    % In production: replace with your annotated dataset.
+    
+    warning('Using auto-labeled demo dataset. For best results, provide manually annotated data.');
+    
+    imgDir = fullfile(config.dataDir, 'demo_faces');
+    if ~exist(imgDir, 'dir'), mkdir(imgDir); end
+    
+    detector = vision.CascadeObjectDetector();
+    cam      = webcam(1);
+    
+    gTruthData = {};
+    numCapture = 50;
+    fprintf('  Capturing %d frames for demo dataset...\n', numCapture);
+    
+    for i = 1:numCapture
+        frame = snapshot(cam);
+        bboxes = step(detector, frame);
+        
+        if ~isempty(bboxes)
+            imgFile = fullfile(imgDir, sprintf('face_%04d.jpg', i));
+            imwrite(frame, imgFile);
+            gTruthData(end+1, :) = {imgFile, bboxes(1,:)};
+        end
+    end
+    
+    clear cam;
+    gTruth = cell2table(gTruthData, 'VariableNames', {'imageFilename', 'face'});
+    save(fullfile(config.dataDir, 'face_annotations.mat'), 'gTruth');
+end
