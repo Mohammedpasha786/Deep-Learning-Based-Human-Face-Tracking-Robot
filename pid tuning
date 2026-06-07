@@ -1,0 +1,127 @@
+%% pid_tuning.m
+% PID Gain Tuning Tool for Face Tracking Servo Control
+% Simulates the closed-loop pan/tilt servo system and plots step response.
+% Adjust Kp, Ki, Kd and observe settling time, overshoot, and steady-state error.
+%
+% Author:AFREED
+% -----------------------------------------------------------------------
+
+clc; clear; close all;
+
+fprintf('=== PID Tuning Tool — Face Tracking Servo ===\n\n');
+
+%% ===== TUNING PARAMETERS (edit these) =====
+PAN = struct('Kp', 0.8, 'Ki', 0.01, 'Kd', 0.05);
+TILT = struct('Kp', 0.6, 'Ki', 0.01, 'Kd', 0.03);
+
+STEP_INPUT   = 100;    % pixels — simulated face offset
+NUM_STEPS    = 80;     % simulation steps (at ~30Hz → ~2.7s)
+SERVO_GAIN   = 0.05;   % how much servo angle changes per PID output unit
+SERVO_MIN    = 30;     % degrees
+SERVO_MAX    = 150;
+SERVO_HOME   = 90;
+
+%% ===== SIMULATION FUNCTION =====
+function [errors, angles] = simulate_pid(Kp, Ki, Kd, step_input, n, ...
+                                          servo_gain, servo_min, servo_max, servo_home)
+    error    = step_input;
+    integral = 0;
+    prevErr  = 0;
+    angle    = servo_home;
+    errors   = zeros(1, n);
+    angles   = zeros(1, n);
+
+    for i = 1:n
+        integral   = integral + error;
+        integral   = max(-500, min(500, integral));
+        derivative = error - prevErr;
+        output     = Kp*error + Ki*integral + Kd*derivative;
+        angle      = angle - output * servo_gain;
+        angle      = max(servo_min, min(servo_max, angle));
+
+        % Plant model: error = step_input - (how far servo moved from home)
+        servo_displacement = (angle - servo_home) * 2;  % 1 deg → 2px
+        error  = step_input - servo_displacement;
+        prevErr = error;
+
+        errors(i) = error;
+        angles(i) = angle;
+    end
+end
+
+%% ===== RUN SIMULATIONS =====
+[pan_err,  pan_ang]  = simulate_pid(PAN.Kp,  PAN.Ki,  PAN.Kd,  STEP_INPUT, NUM_STEPS, ...
+                                     SERVO_GAIN, SERVO_MIN, SERVO_MAX, SERVO_HOME);
+[tilt_err, tilt_ang] = simulate_pid(TILT.Kp, TILT.Ki, TILT.Kd, STEP_INPUT, NUM_STEPS, ...
+                                     SERVO_GAIN, SERVO_MIN, SERVO_MAX, SERVO_HOME);
+
+t = (0:NUM_STEPS-1) / 30;   % time in seconds (30Hz)
+
+%% ===== METRICS =====
+function metrics = compute_metrics(errors, t)
+    target     = 0;
+    threshold  = 0.02 * max(abs(errors));   % 2% of initial
+    settled    = find(abs(errors) < threshold, 1);
+    overshoot  = max(0, -min(errors));      % negative error = overshoot
+    ss_error   = abs(errors(end));
+
+    metrics.settling_time = t(settled) * 1000;   % ms
+    metrics.overshoot     = overshoot;
+    metrics.ss_error      = ss_error;
+end
+
+pan_m  = compute_metrics(pan_err,  t);
+tilt_m = compute_metrics(tilt_err, t);
+
+fprintf('--- Pan Controller (Kp=%.2f, Ki=%.3f, Kd=%.3f) ---\n', PAN.Kp, PAN.Ki, PAN.Kd);
+fprintf('  Settling Time : %.0f ms\n', pan_m.settling_time);
+fprintf('  Overshoot     : %.1f px\n', pan_m.overshoot);
+fprintf('  Steady-State Error: %.2f px\n\n', pan_m.ss_error);
+
+fprintf('--- Tilt Controller (Kp=%.2f, Ki=%.3f, Kd=%.3f) ---\n', TILT.Kp, TILT.Ki, TILT.Kd);
+fprintf('  Settling Time : %.0f ms\n', tilt_m.settling_time);
+fprintf('  Overshoot     : %.1f px\n', tilt_m.overshoot);
+fprintf('  Steady-State Error: %.2f px\n\n', tilt_m.ss_error);
+
+%% ===== PLOTS =====
+figure('Name', 'PID Tuning Results', 'Position', [50 50 1000 700]);
+
+% Pan error
+subplot(2,2,1);
+plot(t, pan_err, 'b-', 'LineWidth', 2); hold on;
+yline(0, 'r--', 'Target');
+yline(10, 'g--', 'Deadband +');
+yline(-10, 'g--', 'Deadband -');
+xlabel('Time (s)'); ylabel('Error (pixels)');
+title(sprintf('Pan Error | Settle: %.0fms | SS: %.1fpx', pan_m.settling_time, pan_m.ss_error));
+grid on; legend('Error', 'Target', 'Deadband');
+
+% Pan angle
+subplot(2,2,2);
+plot(t, pan_ang, 'm-', 'LineWidth', 2); hold on;
+yline(SERVO_HOME, 'k--', 'Home');
+xlabel('Time (s)'); ylabel('Servo Angle (°)');
+title('Pan Servo Angle');
+ylim([SERVO_MIN-5 SERVO_MAX+5]); grid on;
+
+% Tilt error
+subplot(2,2,3);
+plot(t, tilt_err, 'b-', 'LineWidth', 2); hold on;
+yline(0, 'r--', 'Target');
+yline(10, 'g--'); yline(-10, 'g--');
+xlabel('Time (s)'); ylabel('Error (pixels)');
+title(sprintf('Tilt Error | Settle: %.0fms | SS: %.1fpx', tilt_m.settling_time, tilt_m.ss_error));
+grid on;
+
+% Tilt angle
+subplot(2,2,4);
+plot(t, tilt_ang, 'm-', 'LineWidth', 2); hold on;
+yline(SERVO_HOME, 'k--', 'Home');
+xlabel('Time (s)'); ylabel('Servo Angle (°)');
+title('Tilt Servo Angle');
+ylim([SERVO_MIN-5 SERVO_MAX+5]); grid on;
+
+sgtitle('PID Controller Tuning — Face Tracking Servo System', 'FontSize', 14, 'FontWeight', 'bold');
+
+fprintf('Adjust Kp/Ki/Kd values at the top of this script and re-run to tune.\n');
+fprintf('Target: settling time < 500ms, overshoot < 10px, SS error < 2px.\n');
