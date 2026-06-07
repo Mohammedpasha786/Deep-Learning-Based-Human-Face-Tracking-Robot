@@ -1,0 +1,355 @@
+/**
+ * robot_controller.ino
+ * 
+ * Autonomous Human Face Tracking Robot - Arduino Controller
+ * 
+ * Receives face position data from Android device via UDP (through ESP8266/ESP32)
+ * and controls:
+ *   - 2x DC motors (chassis movement: left/right/forward/backward)
+ *   - 2x Servo motors (camera pan/tilt for face centering)
+ *   - HC-SR04 Ultrasonic sensor (distance measurement, emergency stop)
+ *
+ * Hardware:
+ *   - Arduino Uno / Mega
+ *   - ESP8266 (for Wi-Fi / UDP receive) connected via Serial
+ *   - L298N Motor Driver
+ *   - 2x DC Gear Motors
+ *   - 2x SG90 Servos (pan/tilt)
+ *   - HC-SR04 Ultrasonic Sensor
+ *
+ * Communication:
+ *   - UDP Packet: [header(1B), error_x(2B), error_y(2B), face_width(2B), checksum(1B)]
+ *
+ * Author:  [Your Name]
+ * Date:    2024
+ * License: MIT
+ */
+
+#include <Servo.h>
+
+// ============================================================
+//  PIN DEFINITIONS
+// ============================================================
+
+// L298N Motor Driver — Left Motor
+#define MOTOR_L_EN  9     // PWM enable (ENA)
+#define MOTOR_L_IN1 8     // Direction
+#define MOTOR_L_IN2 7     // Direction
+
+// L298N Motor Driver — Right Motor
+#define MOTOR_R_EN  10    // PWM enable (ENB)
+#define MOTOR_R_IN1 6     // Direction
+#define MOTOR_R_IN2 5     // Direction
+
+// Servo Motors (Pan & Tilt)
+#define SERVO_PAN_PIN  3  // Horizontal rotation (left-right)
+#define SERVO_TILT_PIN 4  // Vertical rotation   (up-down)
+
+// HC-SR04 Ultrasonic Sensor
+#define TRIG_PIN   11
+#define ECHO_PIN   12
+
+// Status LED
+#define LED_STATUS 13
+
+// ============================================================
+//  CONSTANTS & PARAMETERS
+// ============================================================
+
+// Servo angle limits
+#define PAN_MIN   30      // degrees
+#define PAN_MAX   150
+#define PAN_HOME  90
+#define TILT_MIN  50
+#define TILT_MAX  130
+#define TILT_HOME 90
+
+// Motor speed
+#define MOTOR_MAX_SPEED  200  // 0-255 PWM
+#define MOTOR_MIN_SPEED   60  // minimum to overcome stiction
+#define MOTOR_TURN_SPEED 150
+
+// Distance thresholds (cm)
+#define SAFE_DISTANCE    50   // stop approaching below this
+#define DANGER_DISTANCE  20   // emergency reverse above this
+
+// PID controller gains (for servo centering)
+#define KP_PAN   0.08f
+#define KI_PAN   0.001f
+#define KD_PAN   0.005f
+#define KP_TILT  0.06f
+#define KI_TILT  0.001f
+#define KD_TILT  0.003f
+
+// Deadband: ignore small errors (pixels)
+#define ERROR_DEADBAND   15
+
+// Packet protocol
+#define PACKET_HEADER    0xAA
+#define PACKET_SIZE      7     // bytes: 1+2+2+2=7 (no checksum byte for simplicity)
+#define SERIAL_BAUD      115200
+
+// ============================================================
+//  GLOBAL VARIABLES
+// ============================================================
+Servo panServo;
+Servo tiltServo;
+
+int   panAngle  = PAN_HOME;
+int   tiltAngle = TILT_HOME;
+
+float pidPanIntegral  = 0.0f;
+float pidPanPrevErr   = 0.0f;
+float pidTiltIntegral = 0.0f;
+float pidTiltPrevErr  = 0.0f;
+
+int16_t errorX    = 0;     // Horizontal error from Android (pixels)
+int16_t errorY    = 0;     // Vertical   error from Android (pixels)
+uint16_t faceWidth = 0;    // Bounding box width (proxy for distance)
+
+bool   faceDetected    = false;
+bool   emergencyStop   = false;
+uint32_t lastPacketMs  = 0;
+uint32_t noFaceTimeout = 2000;   // ms before stopping motors if no face
+
+// ============================================================
+//  SETUP
+// ============================================================
+void setup() {
+    // Status LED
+    pinMode(LED_STATUS, OUTPUT);
+    blink(3, 200);   // startup blink
+
+    // Motor pins
+    pinMode(MOTOR_L_EN,  OUTPUT);
+    pinMode(MOTOR_L_IN1, OUTPUT);
+    pinMode(MOTOR_L_IN2, OUTPUT);
+    pinMode(MOTOR_R_EN,  OUTPUT);
+    pinMode(MOTOR_R_IN1, OUTPUT);
+    pinMode(MOTOR_R_IN2, OUTPUT);
+
+    // Ultrasonic
+    pinMode(TRIG_PIN, OUTPUT);
+    pinMode(ECHO_PIN, INPUT);
+
+    // Servos
+    panServo.attach(SERVO_PAN_PIN);
+    tiltServo.attach(SERVO_TILT_PIN);
+    panServo.write(PAN_HOME);
+    tiltServo.write(TILT_HOME);
+
+    // Serial for ESP8266 communication
+    Serial.begin(SERIAL_BAUD);
+    Serial.println("FaceTrackingRobot Ready");
+
+    stopMotors();
+    digitalWrite(LED_STATUS, HIGH);
+}
+
+// ============================================================
+//  MAIN LOOP
+// ============================================================
+void loop() {
+    // 1) Read incoming UDP packet from ESP8266 via Serial
+    if (readPacketFromSerial()) {
+        lastPacketMs  = millis();
+        faceDetected  = true;
+        emergencyStop = false;
+        digitalWrite(LED_STATUS, HIGH);
+    }
+
+    // 2) Check face timeout (no packet for >2s → face lost)
+    if (millis() - lastPacketMs > noFaceTimeout) {
+        faceDetected = false;
+    }
+
+    // 3) Measure distance
+    float distCm = measureDistance();
+
+    // 4) Emergency stop if too close
+    if (distCm < DANGER_DISTANCE) {
+        emergencyStop = true;
+        reverseMotors(80);
+        delay(300);
+        stopMotors();
+    }
+
+    // 5) Control servos (camera centering)
+    if (faceDetected) {
+        updateServoPID(errorX, errorY);
+    } else {
+        // Return to home position slowly
+        panAngle  += (PAN_HOME  - panAngle)  > 0 ? 1 : -1;
+        tiltAngle += (TILT_HOME - tiltAngle) > 0 ? 1 : -1;
+        panAngle  = constrain(panAngle,  PAN_MIN,  PAN_MAX);
+        tiltAngle = constrain(tiltAngle, TILT_MIN, TILT_MAX);
+        panServo.write(panAngle);
+        tiltServo.write(tiltAngle);
+    }
+
+    // 6) Control chassis motors
+    if (!emergencyStop) {
+        if (faceDetected) {
+            controlChassis(errorX, distCm);
+        } else {
+            stopMotors();
+        }
+    }
+
+    delay(30);   // ~33 Hz control loop
+}
+
+// ============================================================
+//  READ UDP PACKET FROM ESP8266 VIA SERIAL
+// ============================================================
+bool readPacketFromSerial() {
+    static uint8_t buf[PACKET_SIZE];
+    static int     pos = 0;
+
+    while (Serial.available()) {
+        uint8_t b = Serial.read();
+
+        if (pos == 0) {
+            if (b == PACKET_HEADER) { buf[pos++] = b; }
+            continue;
+        }
+
+        buf[pos++] = b;
+
+        if (pos == PACKET_SIZE) {
+            pos = 0;
+            // Validate simple checksum: XOR of bytes 1-5
+            uint8_t chk = 0;
+            for (int i = 1; i < PACKET_SIZE - 1; i++) chk ^= buf[i];
+            if (chk != buf[PACKET_SIZE - 1]) return false;   // bad packet
+
+            // Parse
+            errorX    = (int16_t)((buf[2] << 8) | buf[1]);
+            errorY    = (int16_t)((buf[4] << 8) | buf[3]);
+            faceWidth = (uint16_t)((buf[6] << 8) | buf[5]);
+            return true;
+        }
+    }
+    return false;
+}
+
+// ============================================================
+//  PID-BASED SERVO CONTROL
+// ============================================================
+void updateServoPID(int16_t ex, int16_t ey) {
+    // Pan (horizontal)
+    if (abs(ex) > ERROR_DEADBAND) {
+        float panErr = (float)ex;
+        pidPanIntegral += panErr;
+        pidPanIntegral  = constrain(pidPanIntegral, -200, 200);
+        float panD      = panErr - pidPanPrevErr;
+        float panOut    = KP_PAN * panErr + KI_PAN * pidPanIntegral + KD_PAN * panD;
+        pidPanPrevErr   = panErr;
+        panAngle       -= (int)panOut;   // invert for correct direction
+        panAngle        = constrain(panAngle, PAN_MIN, PAN_MAX);
+        panServo.write(panAngle);
+    }
+
+    // Tilt (vertical)
+    if (abs(ey) > ERROR_DEADBAND) {
+        float tiltErr = (float)ey;
+        pidTiltIntegral += tiltErr;
+        pidTiltIntegral  = constrain(pidTiltIntegral, -200, 200);
+        float tiltD      = tiltErr - pidTiltPrevErr;
+        float tiltOut    = KP_TILT * tiltErr + KI_TILT * pidTiltIntegral + KD_TILT * tiltD;
+        pidTiltPrevErr   = tiltErr;
+        tiltAngle       += (int)tiltOut;
+        tiltAngle        = constrain(tiltAngle, TILT_MIN, TILT_MAX);
+        tiltServo.write(tiltAngle);
+    }
+}
+
+// ============================================================
+//  CHASSIS MOTOR CONTROL
+// ============================================================
+void controlChassis(int16_t ex, float distCm) {
+    // Turn toward face if horizontal error is large
+    if (abs(ex) > ERROR_DEADBAND * 3) {
+        if (ex > 0) {
+            turnRight(MOTOR_TURN_SPEED);
+        } else {
+            turnLeft(MOTOR_TURN_SPEED);
+        }
+        return;
+    }
+
+    // Move forward if face is too far, stop if within safe distance
+    if (distCm > SAFE_DISTANCE) {
+        int spd = map(constrain((int)distCm, SAFE_DISTANCE, 200),
+                      SAFE_DISTANCE, 200, MOTOR_MIN_SPEED, MOTOR_MAX_SPEED);
+        moveForward(spd);
+    } else {
+        stopMotors();
+    }
+}
+
+// ============================================================
+//  MOTOR PRIMITIVES
+// ============================================================
+void moveForward(int speed) {
+    speed = constrain(speed, 0, 255);
+    digitalWrite(MOTOR_L_IN1, HIGH); digitalWrite(MOTOR_L_IN2, LOW);
+    digitalWrite(MOTOR_R_IN1, HIGH); digitalWrite(MOTOR_R_IN2, LOW);
+    analogWrite(MOTOR_L_EN, speed);
+    analogWrite(MOTOR_R_EN, speed);
+}
+
+void reverseMotors(int speed) {
+    speed = constrain(speed, 0, 255);
+    digitalWrite(MOTOR_L_IN1, LOW); digitalWrite(MOTOR_L_IN2, HIGH);
+    digitalWrite(MOTOR_R_IN1, LOW); digitalWrite(MOTOR_R_IN2, HIGH);
+    analogWrite(MOTOR_L_EN, speed);
+    analogWrite(MOTOR_R_EN, speed);
+}
+
+void turnLeft(int speed) {
+    digitalWrite(MOTOR_L_IN1, LOW);  digitalWrite(MOTOR_L_IN2, HIGH);
+    digitalWrite(MOTOR_R_IN1, HIGH); digitalWrite(MOTOR_R_IN2, LOW);
+    analogWrite(MOTOR_L_EN, speed);
+    analogWrite(MOTOR_R_EN, speed);
+}
+
+void turnRight(int speed) {
+    digitalWrite(MOTOR_L_IN1, HIGH); digitalWrite(MOTOR_L_IN2, LOW);
+    digitalWrite(MOTOR_R_IN1, LOW);  digitalWrite(MOTOR_R_IN2, HIGH);
+    analogWrite(MOTOR_L_EN, speed);
+    analogWrite(MOTOR_R_EN, speed);
+}
+
+void stopMotors() {
+    analogWrite(MOTOR_L_EN, 0);
+    analogWrite(MOTOR_R_EN, 0);
+    digitalWrite(MOTOR_L_IN1, LOW); digitalWrite(MOTOR_L_IN2, LOW);
+    digitalWrite(MOTOR_R_IN1, LOW); digitalWrite(MOTOR_R_IN2, LOW);
+}
+
+// ============================================================
+//  ULTRASONIC DISTANCE MEASUREMENT
+// ============================================================
+float measureDistance() {
+    digitalWrite(TRIG_PIN, LOW);
+    delayMicroseconds(2);
+    digitalWrite(TRIG_PIN, HIGH);
+    delayMicroseconds(10);
+    digitalWrite(TRIG_PIN, LOW);
+
+    long duration = pulseIn(ECHO_PIN, HIGH, 30000);   // 30ms timeout
+    if (duration == 0) return 999.0f;                 // no echo = very far
+    return (duration * 0.0343f) / 2.0f;               // cm
+}
+
+// ============================================================
+//  UTILITY
+// ============================================================
+void blink(int n, int ms) {
+    for (int i = 0; i < n; i++) {
+        digitalWrite(LED_STATUS, HIGH); delay(ms);
+        digitalWrite(LED_STATUS, LOW);  delay(ms);
+    }
+}
+
