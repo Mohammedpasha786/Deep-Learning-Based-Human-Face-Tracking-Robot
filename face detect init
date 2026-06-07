@@ -1,0 +1,78 @@
+%% face_detect_init.m
+% Initialization script for the Android Face Detection Simulink model.
+% Run this BEFORE opening FaceDetectionApp.slx
+%
+% Sets up:
+%   - Network parameters (UDP IP & port)
+%   - Camera parameters
+%   - Detection thresholds
+%   - PID gains for position error computation
+%
+% Project: Autonomous Human Face Tracking Robot
+clc; clear;
+
+fprintf('=== Android Face Detection App - Initialization ===\n');
+
+%% ===== NETWORK CONFIGURATION =====
+% IP address of the Arduino/Raspberry Pi robot controller
+% Must be on the same Wi-Fi network as Android device
+ROBOT_IP   = '192.168.1.100';   % ← Change to your robot's IP
+ROBOT_PORT = 5005;              % UDP port (must match Arduino/RPi sketch)
+ANDROID_PORT = 5005;            % UDP listen port on Android (not used for TX)
+
+fprintf('Robot IP   : %s\n', ROBOT_IP);
+fprintf('Robot Port : %d\n', ROBOT_PORT);
+
+%% ===== CAMERA PARAMETERS =====
+CAM_WIDTH   = 640;
+CAM_HEIGHT  = 480;
+CAM_FPS     = 30;
+
+% Image center (reference point for error calculation)
+CENTER_X = CAM_WIDTH  / 2;   % 320 pixels
+CENTER_Y = CAM_HEIGHT / 2;   % 240 pixels
+
+%% ===== DETECTION PARAMETERS =====
+DETECT_THRESHOLD    = 0.5;    % Confidence threshold [0–1]
+NMS_THRESHOLD       = 0.4;    % Non-maximum suppression overlap threshold
+MODEL_INPUT_WIDTH   = 224;
+MODEL_INPUT_HEIGHT  = 224;
+
+% Focal length for distance estimation (calibrate for your camera)
+FOCAL_LENGTH_PX   = 700;     % pixels
+REAL_FACE_WIDTH_CM = 14;     % average adult face width in cm
+SAFE_DISTANCE_CM  = 50;      % robot stops when face is this close
+
+%% ===== UDP PACKET FORMAT =====
+% Packet: [error_x (int16), error_y (int16), face_width (uint16), checksum (uint8)]
+% Total: 7 bytes
+PACKET_HEADER = uint8(0xAA);  % Start byte for packet validation
+
+%% ===== ASSIGN TO BASE WORKSPACE (for Simulink) =====
+assignin('base', 'ROBOT_IP',           ROBOT_IP);
+assignin('base', 'ROBOT_PORT',         ROBOT_PORT);
+assignin('base', 'CAM_WIDTH',          CAM_WIDTH);
+assignin('base', 'CAM_HEIGHT',         CAM_HEIGHT);
+assignin('base', 'CAM_FPS',            CAM_FPS);
+assignin('base', 'CENTER_X',           CENTER_X);
+assignin('base', 'CENTER_Y',           CENTER_Y);
+assignin('base', 'DETECT_THRESHOLD',   DETECT_THRESHOLD);
+assignin('base', 'NMS_THRESHOLD',      NMS_THRESHOLD);
+assignin('base', 'MODEL_INPUT_WIDTH',  MODEL_INPUT_WIDTH);
+assignin('base', 'MODEL_INPUT_HEIGHT', MODEL_INPUT_HEIGHT);
+assignin('base', 'FOCAL_LENGTH_PX',   FOCAL_LENGTH_PX);
+assignin('base', 'REAL_FACE_WIDTH_CM', REAL_FACE_WIDTH_CM);
+assignin('base', 'SAFE_DISTANCE_CM',  SAFE_DISTANCE_CM);
+assignin('base', 'PACKET_HEADER',      PACKET_HEADER);
+
+fprintf('\nParameters loaded into workspace.\n');
+fprintf('   Open FaceDetectionApp.slx and deploy to Android.\n\n');
+
+%% ===== VERIFY MODEL FILE =====
+modelFile = fullfile(pwd, '..', 'android_app', 'face_detector.onnx');
+if exist(modelFile, 'file')
+    fprintf('ONNX model found: face_detector.onnx\n');
+else
+    fprintf('ONNX model NOT found.\n');
+    fprintf('   Run matlab_simulink/scripts/train_face_detector.m first.\n');
+end
