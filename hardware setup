@@ -1,0 +1,159 @@
+# Hardware Setup Guide
+
+## Wiring Diagrams
+
+### Arduino + L298N + HC-SR04 + Servos
+
+                       ┌──────────────────────────────┐
+                       │         ARDUINO UNO           │
+                       │                              │
+  Left Motor ─────┐    │  D3  ──► PAN Servo Signal    │
+  Right Motor ────┤    │  D4  ──► TILT Servo Signal   │
+                  │    │  D5  ──► L298N IN4 (R-Motor) │
+                  │    │  D6  ──► L298N IN3 (R-Motor) │
+                  │    │  D7  ──► L298N IN2 (L-Motor) │
+                  │    │  D8  ──► L298N IN1 (L-Motor) │
+                  │    │  D9  ──► L298N ENA (L-PWM)   │
+                  │    │  D10 ──► L298N ENB (R-PWM)   │
+                  │    │  D11 ──► HC-SR04 TRIG         │
+                  │    │  D12 ◄── HC-SR04 ECHO         │
+                  │    │  D13 ──► Status LED           │
+                  │    │  RX0 ◄── ESP8266 TX           │
+                  │    │  TX1 ──► ESP8266 RX           │
+                  │    │  5V  ──► HC-SR04 VCC          │
+                  │    │  5V  ──► Servo VCC (separate BEC!)│
+                  │    │  GND ──► GND (common)         │
+                  │    └──────────────────────────────┘
+                  │
+                  ▼
+         ┌─────────────────┐
+         │    L298N        │
+         │  ENA ◄── D9     │     ┌──────────────┐
+         │  IN1 ◄── D8     │────►│ Left DC Motor│
+         │  IN2 ◄── D7     │     └──────────────┘
+         │  IN3 ◄── D6     │     ┌──────────────┐
+         │  IN4 ◄── D5     │────►│ Right DC Motor│
+         │  ENB ◄── D10    │     └──────────────┘
+         │  12V ◄── Battery│
+         │  GND ──► GND    │
+         └─────────────────┘
+
+         ┌─────────────────┐
+         │   HC-SR04       │
+         │  VCC  ◄── 5V    │
+         │  TRIG ◄── D11   │
+         │  ECHO ──► D12   │
+         │  GND  ──► GND   │
+         └─────────────────┘
+
+         ┌─────────────────┐       ┌─────────────────┐
+         │   PAN Servo     │       │   TILT Servo    │
+         │  Signal ◄── D3  │       │  Signal ◄── D4  │
+         │  VCC ◄── 5V BEC │       │  VCC ◄── 5V BEC │
+         │  GND ──► GND    │       │  GND ──► GND    │
+         └─────────────────┘       └─────────────────┘
+
+         ┌─────────────────┐
+         │   ESP8266       │
+         │  TX ──► Arduino RX │
+         │  RX ◄── Arduino TX │
+         │  VCC ◄── 3.3V   │
+         │  GND ──► GND    │
+         └─────────────────┘
+
+> **Important**: Use a logic level shifter between Arduino (5V) and ESP8266 (3.3V) on TX/RX lines.
+
+### Raspberry Pi Wiring
+
+   Raspberry Pi 3B+ / 4
+   ┌─────────────────────────────────┐
+   │  GPIO18 (PWM0) ──► L298N ENA   │
+   │  GPIO23        ──► L298N IN1   │
+   │  GPIO24        ──► L298N IN2   │
+   │  GPIO12 (PWM0) ──► L298N ENB   │
+   │  GPIO25        ──► L298N IN3   │
+   │  GPIO8         ──► L298N IN4   │
+   │  GPIO13 (PWM1) ──► PAN Servo   │
+   │  GPIO19 (PWM1) ──► TILT Servo  │
+   │  GPIO7         ──► HC-SR04 TRIG│
+   │  GPIO11        ◄── HC-SR04 ECHO│
+   │  GPIO21        ──► Status LED  │
+   │  5V            ──► L298N Logic │
+   │  GND           ──► GND common  │
+   └─────────────────────────────────┘
+
+## Component List (Bill of Materials)
+
+### Option A: Arduino-Based Robot
+
+| Qty | Component | Notes |
+|-----|-----------|-------|
+| 1 | Arduino Uno R3 | Or Mega 2560 |
+| 1 | ESP8266 NodeMCU | For Wi-Fi UDP |
+| 1 | L298N Motor Driver | Dual H-Bridge |
+| 2 | DC Gear Motor 6V 200RPM | With encoder optional |
+| 1 | 4WD Robot Chassis | With wheels |
+| 2 | SG90 Micro Servo | Pan + Tilt |
+| 1 | Pan-Tilt Bracket | For camera mount |
+| 1 | HC-SR04 Ultrasonic | Distance sensing |
+| 1 | 7.4V 2000mAh LiPo | Main power |
+| 1 | 5V 3A BEC / Buck Converter | For Arduino + Servos |
+| 1 | Logic Level Shifter | 5V↔3.3V for ESP8266 |
+| 1 | Android Phone (≥3GB RAM) | Face detection |
+| — | Jumper Wires, Breadboard | Prototyping |
+| 1 | 3D Printed/Plywood Mount | For Android phone |
+
+**Estimated Cost: ~$45–70 USD**
+
+### Option B: Raspberry Pi-Based Robot
+
+| Qty | Component | Notes |
+|-----|-----------|-------|
+| 1 | Raspberry Pi 4 (2GB+) | |
+| 1 | L298N Motor Driver | |
+| 2 | DC Gear Motor 6V | |
+| 1 | Robot Chassis | |
+| 2 | SG90 Servo | |
+| 1 | HC-SR04 | |
+| 1 | 7.4V LiPo + 5V BEC | |
+| 1 | Android Phone | |
+
+**Estimated Cost: ~$70–100 USD**
+
+## Power Distribution
+
+  7.4V LiPo Battery
+       │
+       ├──────────────────► L298N 12V (motors)
+       │
+       └── 5V BEC ─────────┬──► Arduino/RPi 5V
+                           ├──► Servos VCC (2A dedicated)
+                           └──► HC-SR04 VCC
+
+
+> **Never power servos from the Arduino/RPi 5V pin** — use a dedicated BEC.
+
+
+## Physical Assembly
+
+1. Mount DC motors to chassis frame
+2. Attach wheels and battery tray
+3. Mount L298N driver to chassis
+4. Install pan-tilt bracket at front
+5. Mount Android phone in bracket (camera facing forward)
+6. Mount HC-SR04 at front center (same height as camera)
+7. Secure Arduino/RPi with standoffs
+8. Route wiring cleanly — use cable ties
+
+
+## Calibration
+
+### Camera Focal Length Calibration
+1. Place a ruler at exactly **50 cm** from the camera
+2. Run `test_face_detection.m` and note the detected `face_width` in pixels
+3. Update `FOCAL_LENGTH_PX = (face_width_px * 14) / 50` in init scripts
+
+### Servo Center Calibration
+1. Upload firmware
+2. Set `PAN_HOME` and `TILT_HOME` so camera points straight forward
+3. Adjust until the camera is level and centered
