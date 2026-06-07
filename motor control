@@ -1,0 +1,421 @@
+#!/usr/bin/env python3
+"""
+motor_control.py
+
+Autonomous Human Face Tracking Robot - Raspberry Pi Controller
+Receives face detection data from Android device via UDP and
+controls DC motors and servo motors via GPIO.
+
+Hardware:
+  - Raspberry Pi 3B+ / 4
+  - L298N Motor Driver (or Pololu DRV8835)
+  - 2x DC Gear Motors
+  - 2x SG90 Servo (pan/tilt via pigpio for hardware PWM)
+  - HC-SR04 Ultrasonic Sensor
+
+Communication:
+  UDP Packet (7 bytes):
+  [0xAA][error_x L][error_x H][error_y L][error_y H]
+  [face_width L][face_width H][XOR checksum]
+
+Install dependencies:
+  sudo apt install python3-pigpio
+  sudo systemctl enable pigpiod && sudo systemctl start pigpiod
+  pip3 install pigpio RPi.GPIO
+
+Author:  [Your Name]
+Date:    2024
+License: MIT
+"""
+
+import socket
+import struct
+import threading
+import time
+import signal
+import sys
+import logging
+import RPi.GPIO as GPIO
+import pigpio  # for hardware PWM servos
+
+# ============================================================
+#  CONFIGURATION
+# ============================================================
+NETWORK = {
+    'UDP_IP':   '0.0.0.0',   # Listen on all interfaces
+    'UDP_PORT': 5005,
+}
+
+PINS = {
+    # L298N Motor A (Left)
+    'ENA':   18,   # PWM — use hardware PWM pin
+    'IN1':   23,
+    'IN2':   24,
+    # L298N Motor B (Right)
+    'ENB':   12,   # PWM — use hardware PWM pin
+    'IN3':   25,
+    'IN4':    8,
+    # Servo (pigpio hardware PWM)
+    'PAN':   13,   # BCM pin 13 → hardware PWM
+    'TILT':  19,   # BCM pin 19 → hardware PWM
+    # HC-SR04 Ultrasonic
+    'TRIG':   7,
+    'ECHO':   11,
+    # Status LED
+    'LED':   21,
+}
+
+MOTOR = {
+    'MAX_SPEED':  80,    # % of max PWM duty cycle
+    'MIN_SPEED':  30,
+    'TURN_SPEED': 60,
+    'PWM_FREQ':   1000,  # Hz
+}
+
+SERVO = {
+    'PAN_HOME':   1500,  # µs (90°)
+    'PAN_MIN':     600,  # µs (0°)
+    'PAN_MAX':    2400,  # µs (180°)
+    'TILT_HOME':  1500,
+    'TILT_MIN':   800,
+    'TILT_MAX':   2200,
+    'PWM_FREQ':     50,  # Hz
+}
+
+CONTROL = {
+    'SAFE_DISTANCE_CM':   50,
+    'DANGER_DISTANCE_CM': 20,
+    'ERROR_DEADBAND_PX':  15,
+    'FACE_TIMEOUT_S':      2.0,
+    'KP_PAN':   0.3,
+    'KI_PAN':   0.002,
+    'KD_PAN':   0.05,
+    'KP_TILT':  0.25,
+    'KI_TILT':  0.002,
+    'KD_TILT':  0.04,
+    'LOOP_HZ':  30,
+}
+
+# ============================================================
+#  LOGGING
+# ============================================================
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s [%(levelname)s] %(message)s',
+    datefmt='%H:%M:%S'
+)
+log = logging.getLogger('FaceTracker')
+
+# ============================================================
+#  SHARED STATE
+# ============================================================
+class RobotState:
+    def __init__(self):
+        self.error_x     = 0
+        self.error_y     = 0
+        self.face_width  = 0
+        self.face_detected = False
+        self.last_packet_time = 0.0
+        self.emergency_stop = False
+        self.running     = True
+        self.lock        = threading.Lock()
+
+state = RobotState()
+
+# ============================================================
+#  GPIO SETUP
+# ============================================================
+def setup_gpio():
+    GPIO.setmode(GPIO.BCM)
+    GPIO.setwarnings(False)
+
+    for pin in [PINS['IN1'], PINS['IN2'], PINS['IN3'], PINS['IN4'],
+                PINS['TRIG'], PINS['LED']]:
+        GPIO.setup(pin, GPIO.OUT)
+
+    GPIO.setup(PINS['ECHO'], GPIO.IN)
+
+    # PWM for motors
+    global pwm_a, pwm_b
+    GPIO.setup(PINS['ENA'], GPIO.OUT)
+    GPIO.setup(PINS['ENB'], GPIO.OUT)
+    pwm_a = GPIO.PWM(PINS['ENA'], MOTOR['PWM_FREQ'])
+    pwm_b = GPIO.PWM(PINS['ENB'], MOTOR['PWM_FREQ'])
+    pwm_a.start(0)
+    pwm_b.start(0)
+
+    log.info('GPIO initialized.')
+
+# ============================================================
+#  PIGPIO SERVO CONTROL
+# ============================================================
+pi = pigpio.pi()
+
+pan_pw  = SERVO['PAN_HOME']
+tilt_pw = SERVO['TILT_HOME']
+
+def set_servo(pin, pulsewidth_us):
+    pi.set_servo_pulsewidth(pin, pulsewidth_us)
+
+def servos_home():
+    global pan_pw, tilt_pw
+    pan_pw  = SERVO['PAN_HOME']
+    tilt_pw = SERVO['TILT_HOME']
+    set_servo(PINS['PAN'],  pan_pw)
+    set_servo(PINS['TILT'], tilt_pw)
+
+# ============================================================
+#  MOTOR CONTROL
+# ============================================================
+def stop_motors():
+    GPIO.output(PINS['IN1'], GPIO.LOW)
+    GPIO.output(PINS['IN2'], GPIO.LOW)
+    GPIO.output(PINS['IN3'], GPIO.LOW)
+    GPIO.output(PINS['IN4'], GPIO.LOW)
+    pwm_a.ChangeDutyCycle(0)
+    pwm_b.ChangeDutyCycle(0)
+
+def move_forward(speed: int):
+    speed = max(MOTOR['MIN_SPEED'], min(MOTOR['MAX_SPEED'], speed))
+    GPIO.output(PINS['IN1'], GPIO.HIGH)
+    GPIO.output(PINS['IN2'], GPIO.LOW)
+    GPIO.output(PINS['IN3'], GPIO.HIGH)
+    GPIO.output(PINS['IN4'], GPIO.LOW)
+    pwm_a.ChangeDutyCycle(speed)
+    pwm_b.ChangeDutyCycle(speed)
+
+def reverse(speed: int):
+    speed = max(0, min(100, speed))
+    GPIO.output(PINS['IN1'], GPIO.LOW)
+    GPIO.output(PINS['IN2'], GPIO.HIGH)
+    GPIO.output(PINS['IN3'], GPIO.LOW)
+    GPIO.output(PINS['IN4'], GPIO.HIGH)
+    pwm_a.ChangeDutyCycle(speed)
+    pwm_b.ChangeDutyCycle(speed)
+
+def turn_left(speed: int):
+    GPIO.output(PINS['IN1'], GPIO.LOW)
+    GPIO.output(PINS['IN2'], GPIO.HIGH)
+    GPIO.output(PINS['IN3'], GPIO.HIGH)
+    GPIO.output(PINS['IN4'], GPIO.LOW)
+    pwm_a.ChangeDutyCycle(speed)
+    pwm_b.ChangeDutyCycle(speed)
+
+def turn_right(speed: int):
+    GPIO.output(PINS['IN1'], GPIO.HIGH)
+    GPIO.output(PINS['IN2'], GPIO.LOW)
+    GPIO.output(PINS['IN3'], GPIO.LOW)
+    GPIO.output(PINS['IN4'], GPIO.HIGH)
+    pwm_a.ChangeDutyCycle(speed)
+    pwm_b.ChangeDutyCycle(speed)
+
+# ============================================================
+#  ULTRASONIC DISTANCE
+# ============================================================
+def measure_distance() -> float:
+    """Returns distance in cm. Returns 999 on timeout."""
+    GPIO.output(PINS['TRIG'], GPIO.LOW)
+    time.sleep(0.00002)
+    GPIO.output(PINS['TRIG'], GPIO.HIGH)
+    time.sleep(0.00001)
+    GPIO.output(PINS['TRIG'], GPIO.LOW)
+
+    timeout = time.time() + 0.03
+    pulse_start = time.time()
+    while GPIO.input(PINS['ECHO']) == 0:
+        pulse_start = time.time()
+        if pulse_start > timeout:
+            return 999.0
+
+    pulse_end = time.time()
+    while GPIO.input(PINS['ECHO']) == 1:
+        pulse_end = time.time()
+        if pulse_end > timeout:
+            return 999.0
+
+    duration = pulse_end - pulse_start
+    distance = (duration * 34300) / 2.0
+    return round(distance, 1)
+
+# ============================================================
+#  UDP RECEIVER THREAD
+# ============================================================
+def udp_receiver():
+    """Listens for UDP packets from Android and updates state."""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    sock.bind((NETWORK['UDP_IP'], NETWORK['UDP_PORT']))
+    sock.settimeout(0.5)
+
+    HEADER   = 0xAA
+    PKT_SIZE = 7
+
+    log.info(f"UDP listener started on port {NETWORK['UDP_PORT']}")
+
+    while state.running:
+        try:
+            data, addr = sock.recvfrom(64)
+        except socket.timeout:
+            continue
+        except Exception as e:
+            log.warning(f'UDP error: {e}')
+            continue
+
+        if len(data) < PKT_SIZE or data[0] != HEADER:
+            continue
+
+        # Validate XOR checksum
+        chk = 0
+        for b in data[1:PKT_SIZE - 1]:
+            chk ^= b
+        if chk != data[PKT_SIZE - 1]:
+            log.debug('Bad checksum, dropping packet')
+            continue
+
+        # Parse packet
+        error_x    = struct.unpack_from('<h', data, 1)[0]   # int16
+        error_y    = struct.unpack_from('<h', data, 3)[0]   # int16
+        face_width = struct.unpack_from('<H', data, 5)[0]   # uint16
+
+        with state.lock:
+            state.error_x          = error_x
+            state.error_y          = error_y
+            state.face_width       = face_width
+            state.face_detected    = True
+            state.last_packet_time = time.time()
+
+    sock.close()
+    log.info('UDP receiver stopped.')
+
+# ============================================================
+#  PID SERVO CONTROL
+# ============================================================
+class PIDController:
+    def __init__(self, kp, ki, kd, out_min, out_max):
+        self.kp, self.ki, self.kd = kp, ki, kd
+        self.out_min, self.out_max = out_min, out_max
+        self.integral  = 0.0
+        self.prev_err  = 0.0
+
+    def compute(self, error: float) -> float:
+        self.integral  = max(-500, min(500, self.integral + error))
+        derivative     = error - self.prev_err
+        output         = self.kp * error + self.ki * self.integral + self.kd * derivative
+        self.prev_err  = error
+        return max(self.out_min, min(self.out_max, output))
+
+    def reset(self):
+        self.integral = 0.0
+        self.prev_err = 0.0
+
+pid_pan  = PIDController(CONTROL['KP_PAN'],  CONTROL['KI_PAN'],  CONTROL['KD_PAN'],  -300, 300)
+pid_tilt = PIDController(CONTROL['KP_TILT'], CONTROL['KI_TILT'], CONTROL['KD_TILT'], -200, 200)
+
+# ============================================================
+#  MAIN CONTROL LOOP
+# ============================================================
+def control_loop():
+    global pan_pw, tilt_pw
+    dt = 1.0 / CONTROL['LOOP_HZ']
+    log.info('Control loop started.')
+
+    while state.running:
+        t0 = time.time()
+
+        # Check face timeout
+        with state.lock:
+            ex = state.error_x
+            ey = state.error_y
+            fw = state.face_width
+            face_ok = state.face_detected
+            if face_ok and (time.time() - state.last_packet_time > CONTROL['FACE_TIMEOUT_S']):
+                state.face_detected = False
+                face_ok = False
+
+        # Distance check
+        dist = measure_distance()
+        if dist < CONTROL['DANGER_DISTANCE_CM']:
+            reverse(50)
+            time.sleep(0.3)
+            stop_motors()
+            time.sleep(dt - (time.time() - t0))
+            continue
+
+        # Servo PID
+        deadband = CONTROL['ERROR_DEADBAND_PX']
+        if face_ok:
+            if abs(ex) > deadband:
+                pan_out  = pid_pan.compute(-ex)   # negate: positive error → pan left
+                pan_pw   = int(pan_pw + pan_out)
+                pan_pw   = max(SERVO['PAN_MIN'], min(SERVO['PAN_MAX'], pan_pw))
+                set_servo(PINS['PAN'], pan_pw)
+            if abs(ey) > deadband:
+                tilt_out = pid_tilt.compute(ey)
+                tilt_pw  = int(tilt_pw + tilt_out)
+                tilt_pw  = max(SERVO['TILT_MIN'], min(SERVO['TILT_MAX'], tilt_pw))
+                set_servo(PINS['TILT'], tilt_pw)
+        else:
+            # Drift back to home
+            pan_pw  += (SERVO['PAN_HOME']  - pan_pw)  // 10 or 0
+            tilt_pw += (SERVO['TILT_HOME'] - tilt_pw) // 10 or 0
+            set_servo(PINS['PAN'],  pan_pw)
+            set_servo(PINS['TILT'], tilt_pw)
+            pid_pan.reset()
+            pid_tilt.reset()
+
+        # Chassis motors
+        if face_ok:
+            if abs(ex) > deadband * 3:
+                if ex > 0:
+                    turn_right(CONTROL['TURN_SPEED'])
+                else:
+                    turn_left(CONTROL['TURN_SPEED'])
+            elif dist > CONTROL['SAFE_DISTANCE_CM']:
+                spd = int((dist - CONTROL['SAFE_DISTANCE_CM']) / 2 + MOTOR['MIN_SPEED'])
+                spd = min(spd, MOTOR['MAX_SPEED'])
+                move_forward(spd)
+            else:
+                stop_motors()
+        else:
+            stop_motors()
+
+        # Status LED blink if face active
+        GPIO.output(PINS['LED'], GPIO.HIGH if face_ok else GPIO.LOW)
+
+        elapsed = time.time() - t0
+        sleep_t = max(0, dt - elapsed)
+        time.sleep(sleep_t)
+
+    log.info('Control loop stopped.')
+
+# ============================================================
+#  GRACEFUL SHUTDOWN
+# ============================================================
+def shutdown(sig=None, frame=None):
+    log.info('Shutting down...')
+    state.running = False
+    time.sleep(0.5)
+    stop_motors()
+    pi.set_servo_pulsewidth(PINS['PAN'],  0)
+    pi.set_servo_pulsewidth(PINS['TILT'], 0)
+    pi.stop()
+    GPIO.cleanup()
+    log.info('Goodbye!')
+    sys.exit(0)
+
+signal.signal(signal.SIGINT,  shutdown)
+signal.signal(signal.SIGTERM, shutdown)
+
+# ============================================================
+#  ENTRY POINT
+# ============================================================
+if __name__ == '__main__':
+    log.info('=== Face Tracking Robot (Raspberry Pi) ===')
+    setup_gpio()
+    servos_home()
+
+    # Start UDP receiver thread
+    rx_thread = threading.Thread(target=udp_receiver, daemon=True)
+    rx_thread.start()
+
+    # Run control loop (blocking)
+    control_loop()
