@@ -1,0 +1,169 @@
+%% test_face_detection.m
+% Real-time face detection test using webcam or image file.
+% Runs the trained deep learning face detector and visualizes results.
+% Project: Autonomous Human Face Tracking Robot
+% Author: [MD.Afreed pasha]
+clc; clear; close all;
+
+%% ===== CONFIGURATION =====
+CONFIG.modelFile    = 'face_detector_model.mat';
+CONFIG.useWebcam    = true;       % false = use static image
+CONFIG.testImage    = '';         % path if useWebcam=false
+CONFIG.threshold    = 0.5;        % detection confidence threshold
+CONFIG.maxFrames    = 300;        % max frames for webcam mode
+CONFIG.showFPS      = true;
+CONFIG.safeDistance = 50;         % cm — robot stop distance (visual reference)
+
+fprintf('=== Face Detection Test ===\n');
+
+%% ===== LOAD MODEL =====
+fprintf('Loading face detection model...\n');
+if ~exist(CONFIG.modelFile, 'file')
+    error(['Model file not found: %s\n', ...
+        'Run train_face_detector.m first.'], CONFIG.modelFile);
+end
+load(CONFIG.modelFile, 'detector');
+fprintf('Model loaded successfully.\n\n');
+
+%% ===== RUN DETECTION =====
+if CONFIG.useWebcam
+    fprintf('Starting webcam face detection. Press Q or close window to stop.\n\n');
+    run_webcam_detection(detector, CONFIG);
+else
+    fprintf('Running detection on image: %s\n', CONFIG.testImage);
+    run_image_detection(detector, CONFIG);
+end
+
+%% ===== HELPER: Webcam Real-Time Detection =====
+function run_webcam_detection(detector, cfg)
+    try
+        cam = webcam(1);
+    catch
+        error('No webcam detected. Set CONFIG.useWebcam = false to use an image.');
+    end
+
+    fig = figure('Name', 'Face Detection - Press Q to Quit', ...
+        'KeyPressFcn', @(src,evt) setappdata(src,'quit',strcmp(evt.Key,'q')));
+    setappdata(fig, 'quit', false);
+
+    imgW = 640; imgH = 480;
+    frameCount  = 0;
+    tStart      = tic;
+    fpsFilter   = 30;   % initial FPS estimate
+
+    while frameCount < cfg.maxFrames
+        % Check quit
+        if ~ishandle(fig) || getappdata(fig, 'quit'), break; end
+
+        % Capture frame
+        frame = snapshot(cam);
+        frame = imresize(frame, [imgH imgW]);
+        frameCount = frameCount + 1;
+
+        % Run face detection
+        tDetect = tic;
+        [bboxes, scores, ~] = detect(detector, frame, ...
+            'Threshold', cfg.threshold, ...
+            'SelectStrongest', true);
+        detectTime = toc(tDetect) * 1000;   % ms
+
+        % Compute position error (for robot control reference)
+        centerX = imgW / 2;
+        centerY = imgH / 2;
+
+        annotated = frame;
+
+        if ~isempty(bboxes)
+            for i = 1:size(bboxes, 1)
+                bbox   = bboxes(i, :);
+                score  = scores(i);
+
+                % Face center
+                faceCX = bbox(1) + bbox(3)/2;
+                faceCY = bbox(2) + bbox(4)/2;
+                errorX = faceCX - centerX;
+                errorY = faceCY - centerY;
+
+                % Estimated distance (face width heuristic: ~14 cm real face)
+                focalLength  = 700;  % pixels (calibrate for your camera)
+                realFaceWidth = 14;  % cm
+                distEstimate = (realFaceWidth * focalLength) / bbox(3);
+
+                % Annotate frame
+                label = sprintf('Face %.0f%% | %.1fcm', score*100, distEstimate);
+                annotated = insertObjectAnnotation(annotated, 'rectangle', bbox, label, ...
+                    'Color', [0 255 0], 'TextBoxOpacity', 0.7, ...
+                    'FontSize', 14, 'LineWidth', 3);
+
+                % Draw crosshair at face center
+                annotated = insertShape(annotated, 'cross', [faceCX faceCY 20 20], ...
+                    'Color', 'yellow', 'LineWidth', 2);
+
+                % Draw error arrows from image center
+                annotated = insertShape(annotated, 'arrow', ...
+                    [centerX centerY faceCX faceCY], ...
+                    'Color', 'red', 'LineWidth', 2);
+
+                % Safe distance warning
+                if distEstimate < cfg.safeDistance
+                    annotated = insertText(annotated, [10 10], ...
+                        sprintf('⚠ STOP! Distance: %.1fcm', distEstimate), ...
+                        'FontSize', 16, 'BoxColor', 'red', 'TextColor', 'white');
+                end
+            end
+        else
+            % No face detected
+            annotated = insertText(annotated, [imgW/2-80, imgH/2], ...
+                'No Face Detected', ...
+                'FontSize', 18, 'BoxColor', 'black', 'TextColor', 'white');
+        end
+
+        % Draw image center crosshair
+        annotated = insertShape(annotated, 'cross', [centerX centerY 30 30], ...
+            'Color', 'blue', 'LineWidth', 2);
+
+        % FPS overlay
+        elapsed = toc(tStart);
+        instFPS = 1 / (detectTime / 1000 + 0.001);
+        fpsFilter = 0.9 * fpsFilter + 0.1 * instFPS;
+
+        if cfg.showFPS
+            annotated = insertText(annotated, [5 imgH-35], ...
+                sprintf('FPS: %.1f | Detect: %.0fms | Frame: %d', ...
+                fpsFilter, detectTime, frameCount), ...
+                'FontSize', 12, 'BoxColor', 'black', 'TextColor', 'green');
+        end
+
+        % Display
+        imshow(annotated, 'Parent', gca);
+        title(sprintf('Real-Time Face Detection | %d faces', size(bboxes,1)));
+        drawnow limitrate;
+    end
+
+    clear cam;
+    fprintf('\nDetection stopped. Processed %d frames in %.1fs (avg %.1f FPS).\n', ...
+        frameCount, toc(tStart), frameCount / toc(tStart));
+end
+
+%% ===== HELPER: Static Image Detection =====
+function run_image_detection(detector, cfg)
+    if isempty(cfg.testImage) || ~exist(cfg.testImage, 'file')
+        error('Test image not found: %s', cfg.testImage);
+    end
+
+    img = imread(cfg.testImage);
+    fprintf('Image size: %dx%d\n', size(img,2), size(img,1));
+
+    tic;
+    [bboxes, scores, labels] = detect(detector, img, 'Threshold', cfg.threshold);
+    elapsed = toc * 1000;
+
+    fprintf('Detected %d face(s) in %.1f ms\n', size(bboxes,1), elapsed);
+
+    figure('Name', 'Face Detection Result', 'NumberTitle', 'off');
+    annotated = insertObjectAnnotation(img, 'rectangle', bboxes, ...
+        arrayfun(@(s) sprintf('%.1f%%', s*100), scores, 'UniformOutput', false), ...
+        'Color', [0 255 0], 'LineWidth', 3, 'FontSize', 14);
+    imshow(annotated);
+    title(sprintf('Detected %d face(s) | Inference: %.1f ms', size(bboxes,1), elapsed));
+end
