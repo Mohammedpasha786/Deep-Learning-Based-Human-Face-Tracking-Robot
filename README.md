@@ -1,11 +1,4 @@
-# 🤖 Deep Learning-Based Human Face Tracking Robot
-
-[![MATLAB](https://img.shields.io/badge/MATLAB-R2023a+-blue.svg)](https://www.mathworks.com/)
-[![Simulink](https://img.shields.io/badge/Simulink-R2023a+-orange.svg)](https://www.mathworks.com/products/simulink.html)
-[![Arduino](https://img.shields.io/badge/Arduino-Compatible-00979D.svg)](https://www.arduino.cc/)
-[![Raspberry Pi](https://img.shields.io/badge/Raspberry%20Pi-Compatible-C51A4A.svg)](https://www.raspberrypi.org/)
-[![Android](https://img.shields.io/badge/Android-8.0+-3DDC84.svg)](https://developer.android.com/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+# Deep Learning-Based Human Face Tracking Robot
 
 > A real-time, low-cost autonomous human face tracking robot using Android Deep Learning + Arduino/Raspberry Pi, built with MathWorks MATLAB & Simulink toolboxes.
 
@@ -13,11 +6,11 @@
 
 This project implements a **real-time autonomous human face tracking robot** that leverages:
 
-- 📱 **Android device** for computationally intensive Deep Learning-based face detection
-- 🧠 **Deep Learning Toolbox™** (MathWorks) for training and deploying the face detection model
-- 🔧 **Arduino / Raspberry Pi** for real-time motor control and robot movement
-- 📡 **Wi-Fi / UDP communication** between Android and the robot controller
-- 🎯 **PID-based servo control** to keep detected face centered in the camera frame
+**Android device** for computationally intensive Deep Learning-based face detection
+**Deep Learning Toolbox™** (MathWorks) for training and deploying the face detection model
+**Arduino / Raspberry Pi** for real-time motor control and robot movement
+**Wi-Fi / UDP communication** between Android and the robot controller
+**PID-based servo control** to keep detected face centered in the camera frame
 
 The robot continuously tracks the human face, moves toward them, and maintains a pre-defined safe distance — enabling seamless **Human-Robot Interaction (HRI)**.
 
